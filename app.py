@@ -113,7 +113,7 @@ if not col_charterer:
 # UI
 # -----------------------------
 st.title("Counterparty (Charterer) Search")
-st.caption("Source: Google Sheet (single source of truth)")
+st.caption("Source: Counterparty List")
 
 c1, c2 = st.columns([2, 1])
 with c1:
