@@ -1,5 +1,5 @@
 import re
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -10,6 +10,8 @@ st.set_page_config(page_title="Counterparty / Charterer Search", layout="wide")
 
 SPREADSHEET_ID = st.secrets["app"]["spreadsheet_id"]
 WORKSHEET_NAME = st.secrets["app"].get("worksheet_name", "Sheet1")
+
+STATUS_OPTIONS = ["Approved", "Pending", "Rejected"]
 
 # -----------------------------
 # Helpers
@@ -43,9 +45,18 @@ def _status_badge(value: str) -> str:
         return "⛔ **REJECTED**"
     return f"**{value}**" if value else "—"
 
+def _normalize_status(value: str) -> str:
+    """Map sheet values to one of STATUS_OPTIONS when possible."""
+    v = (value or "").strip().lower()
+    if v in {"approved", "approve", "a"}:
+        return "Approved"
+    if v in {"pending", "in review", "review"}:
+        return "Pending"
+    if v in {"rejected", "reject", "declined"}:
+        return "Rejected"
+    return (value or "").strip()
+
 def _get_gspread_client(write: bool) -> gspread.Client:
-    # READ ONLY:  spreadsheets.readonly
-    # READ/WRITE: spreadsheets
     scopes = ["https://www.googleapis.com/auth/spreadsheets"] if write else [
         "https://www.googleapis.com/auth/spreadsheets.readonly"
     ]
@@ -54,35 +65,64 @@ def _get_gspread_client(write: bool) -> gspread.Client:
     )
     return gspread.authorize(creds)
 
+def _colnum_to_a1(col_num_1_based: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA ..."""
+    s = ""
+    n = col_num_1_based
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
 @st.cache_data(ttl=60, show_spinner=False)
-def load_from_google_sheet(spreadsheet_id: str, worksheet_name: str) -> pd.DataFrame:
+def load_sheet(spreadsheet_id: str, worksheet_name: str) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Returns:
+      df: DataFrame of sheet contents with an extra '_rownum' column for editing
+      headers: list of header names in sheet order
+    """
     gc = _get_gspread_client(write=False)
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(worksheet_name)
 
     values = ws.get_all_values()
     if not values or len(values) < 2:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
 
     headers = [h.strip() for h in values[0]]
-    rows = values[1:]
+    rows = values[1:]  # data rows
+
     df = pd.DataFrame(rows, columns=headers)
 
+    # Clean up
     for c in df.columns:
         df[c] = df[c].map(_clean_cell).astype("string")
 
-    return df
+    # Add actual sheet row number (header is row 1, first data row is row 2)
+    df["_rownum"] = [i + 2 for i in range(len(df))]
 
-def append_row_to_google_sheet(spreadsheet_id: str, worksheet_name: str, headers: List[str], row_dict: dict) -> None:
+    return df, headers
+
+def append_row(spreadsheet_id: str, worksheet_name: str, headers: List[str], row_dict: dict) -> None:
+    gc = _get_gspread_client(write=True)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+
+    new_row = [_clean_cell(row_dict.get(h, "")) for h in headers]
+    ws.append_row(new_row, value_input_option="USER_ENTERED")
+
+def update_row(spreadsheet_id: str, worksheet_name: str, headers: List[str], rownum: int, row_dict: dict) -> None:
     """
-    Appends one row to the sheet in the exact header order.
+    Updates a full row (all columns) at sheet row number = rownum.
     """
     gc = _get_gspread_client(write=True)
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(worksheet_name)
 
-    new_row = [ _clean_cell(row_dict.get(h, "")) for h in headers ]
-    ws.append_row(new_row, value_input_option="USER_ENTERED")
+    row_values = [_clean_cell(row_dict.get(h, "")) for h in headers]
+    last_col_letter = _colnum_to_a1(len(headers))
+    rng = f"A{rownum}:{last_col_letter}{rownum}"
+    ws.update(rng, [row_values], value_input_option="USER_ENTERED")
 
 def is_admin_unlocked() -> bool:
     return bool(st.session_state.get("admin_ok", False))
@@ -101,18 +141,14 @@ def admin_login_ui():
                 st.error("Incorrect password.")
 
 # -----------------------------
-# Load
+# Load data
 # -----------------------------
-df = load_from_google_sheet(SPREADSHEET_ID, WORKSHEET_NAME)
+df, headers = load_sheet(SPREADSHEET_ID, WORKSHEET_NAME)
 if df.empty:
     st.error("Google Sheet is empty or could not be read.")
     st.stop()
 
-headers = list(df.columns)
-
-# -----------------------------
 # Column mapping
-# -----------------------------
 col_status    = _find_col(df, ["Status"])
 col_charterer = _find_col(df, ["Charterer"])
 col_company   = _find_col(df, ["Company"])
@@ -128,6 +164,7 @@ col_dynamar   = _find_col(df, ["Dynamar", "Dynamar Rating"])
 col_sanctions = _find_col(df, ["Sanctions Check", "Sanction Check", "Sanctions"])
 col_comments  = _find_col(df, ["Comment", "Comments"])
 
+# Validate must-have columns
 required_missing = []
 for name, c in [
     ("Status", col_status),
@@ -157,6 +194,7 @@ with c2:
 
 df_work = df.copy()
 
+# Search: prefer charterer matches; else full-row search
 if search_text.strip():
     s = search_text.strip().lower()
     charterer_series = df_work[col_charterer].astype("string").fillna("")
@@ -173,6 +211,7 @@ else:
 if not show_only and search_text.strip():
     df_filtered = df_work.copy()
 
+# Selector (Charterer)
 options = df_filtered[col_charterer].dropna().astype("string")
 options = options[options.str.len() > 0]
 options_unique = sorted(options.unique().tolist(), key=lambda x: x.lower())
@@ -183,10 +222,23 @@ selected = st.selectbox("Select charterer / counterparty", ["(select)"] + option
 # Details view
 # -----------------------------
 if selected != "(select)":
-    row = df_work[df_work[col_charterer].astype("string") == selected].head(1)
+    matches = df_work[df_work[col_charterer].astype("string") == selected].copy()
+
+    # If duplicates exist, let user select which row
+    if len(matches) > 1:
+        st.info(f"Found {len(matches)} matching rows for this charterer (duplicates). Select the correct one:")
+        match_labels = []
+        for _, rr in matches.iterrows():
+            label = f"Row {rr['_rownum']} | {rr.get(col_company, '')} | {rr.get(col_status, '')}"
+            match_labels.append(label)
+        pick = st.selectbox("Pick record", match_labels)
+        picked_rownum = int(pick.split("|")[0].replace("Row", "").strip())
+        row = matches[matches["_rownum"] == picked_rownum].head(1)
+    else:
+        row = matches.head(1)
 
     if row.empty:
-        st.warning("No exact match found (possible whitespace/duplicate formatting). Try searching again.")
+        st.warning("No exact match found. Try searching again.")
     else:
         r = row.iloc[0]
 
@@ -239,34 +291,43 @@ table_cols = [c for c in table_cols if c and c in df_filtered.columns]
 st.dataframe(df_filtered[table_cols], use_container_width=True, hide_index=True)
 
 # -----------------------------
-# Admin: Add new row (password protected)
+# Admin: Add + Edit (password protected)
 # -----------------------------
-with st.expander("🔒 Admin: Add new counterparty", expanded=False):
+with st.expander("🔒 Admin: Add / Edit counterparties", expanded=False):
     if not is_admin_unlocked():
         admin_login_ui()
-    else:
-        st.success("Admin is unlocked for this session.")
-        st.caption("This form will append a new row to the Google Sheet using the sheet's header order.")
+        st.stop()
 
-        # Dynamic form: one field per column
+    st.success("Admin is unlocked for this session.")
+
+    tab_add, tab_edit = st.tabs(["➕ Add new", "✏️ Edit existing"])
+
+    # ---------- ADD ----------
+    with tab_add:
+        st.caption("Adds a new row to the Google Sheet (appends).")
+
         with st.form("add_counterparty_form", clear_on_submit=True):
             new_data = {}
 
-            # Make a nicer layout: key columns first, then the rest
-            priority = [col_status, col_charterer, col_company, col_owner, col_address]
-            priority = [c for c in priority if c]
+            # Status dropdown
+            current_status = ""
+            new_data[col_status] = st.selectbox("Status", STATUS_OPTIONS, index=0)
 
-            ordered_cols = []
+            # Priority fields
+            priority = [col_charterer, col_company, col_owner, col_address]
             for c in priority:
-                if c in headers:
-                    ordered_cols.append(c)
-            for c in headers:
-                if c not in ordered_cols:
-                    ordered_cols.append(c)
+                if c and c in headers:
+                    if c == col_address:
+                        new_data[c] = st.text_area(c, value="")
+                    else:
+                        new_data[c] = st.text_input(c, value="")
 
-            for c in ordered_cols:
-                # Use multiline for longer text-ish columns
-                if c and any(k in c.lower() for k in ["address", "comment", "remarks", "notes", "pool"]):
+            # Remaining columns (exclude those already handled)
+            handled = set([col_status] + priority)
+            for c in headers:
+                if c in handled:
+                    continue
+                if any(k in c.lower() for k in ["address", "comment", "remarks", "notes", "pool"]):
                     new_data[c] = st.text_area(c, value="")
                 else:
                     new_data[c] = st.text_input(c, value="")
@@ -274,22 +335,81 @@ with st.expander("🔒 Admin: Add new counterparty", expanded=False):
             submitted = st.form_submit_button("Add to Google Sheet")
 
             if submitted:
-                # Basic validation: require at least Charterer
                 if not _clean_cell(new_data.get(col_charterer, "")):
                     st.error("Charterer is required.")
                 else:
                     try:
-                        append_row_to_google_sheet(
-                            SPREADSHEET_ID,
-                            WORKSHEET_NAME,
-                            headers=headers,
-                            row_dict=new_data
-                        )
-                        st.success("Added successfully. Refreshing data…")
+                        append_row(SPREADSHEET_ID, WORKSHEET_NAME, headers=headers, row_dict=new_data)
+                        st.success("Added successfully. Refreshing…")
                         st.cache_data.clear()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Failed to append row. Error: {e}")
 
+    # ---------- EDIT ----------
+    with tab_edit:
+        st.caption("Edits an existing row in-place (updates the full row).")
 
+        # Choose record to edit (handles duplicates)
+        df_edit = df_work.copy()
+        df_edit["_label"] = (
+            "Row " + df_edit["_rownum"].astype(str)
+            + " | " + df_edit[col_charterer].astype("string")
+            + " | " + df_edit[col_company].astype("string")
+            + " | " + df_edit[col_status].astype("string")
+        )
+        labels = df_edit["_label"].tolist()
+        selected_label = st.selectbox("Select record to edit", ["(select)"] + labels)
 
+        if selected_label != "(select)":
+            rownum = int(selected_label.split("|")[0].replace("Row", "").strip())
+            rec = df_edit[df_edit["_rownum"] == rownum].head(1)
+            if rec.empty:
+                st.error("Could not load the selected record.")
+            else:
+                rr = rec.iloc[0]
+                existing = {h: rr.get(h, "") for h in headers}
+
+                with st.form("edit_counterparty_form", clear_on_submit=False):
+                    edited = {}
+
+                    # Status dropdown (preselect if matches)
+                    existing_status = _normalize_status(existing.get(col_status, ""))
+                    if existing_status in STATUS_OPTIONS:
+                        idx = STATUS_OPTIONS.index(existing_status)
+                    else:
+                        idx = 0
+                    edited[col_status] = st.selectbox("Status", STATUS_OPTIONS, index=idx)
+
+                    # Priority fields
+                    for c in [col_charterer, col_company, col_owner, col_address]:
+                        if c and c in headers:
+                            if c == col_address:
+                                edited[c] = st.text_area(c, value=existing.get(c, ""))
+                            else:
+                                edited[c] = st.text_input(c, value=existing.get(c, ""))
+
+                    # Remaining columns
+                    handled = set([col_status, col_charterer, col_company, col_owner, col_address])
+                    for c in headers:
+                        if c in handled:
+                            continue
+                        if any(k in c.lower() for k in ["address", "comment", "remarks", "notes", "pool"]):
+                            edited[c] = st.text_area(c, value=existing.get(c, ""))
+                        else:
+                            edited[c] = st.text_input(c, value=existing.get(c, ""))
+
+                    colA, colB = st.columns([1, 2])
+                    with colA:
+                        save = st.form_submit_button("Save changes")
+                    with colB:
+                        st.caption("Saving overwrites the entire row in Google Sheets for this record.")
+
+                    if save:
+                        try:
+                            update_row(SPREADSHEET_ID, WORKSHEET_NAME, headers=headers, rownum=rownum, row_dict=edited)
+                            st.success("Updated successfully. Refreshing…")
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to update row. Error: {e}")
