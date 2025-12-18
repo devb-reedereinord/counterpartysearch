@@ -7,6 +7,9 @@ from typing import Optional
 
 st.set_page_config(page_title="Counterparty / Charterer Search", layout="wide")
 
+# -----------------------------
+# Secrets config
+# -----------------------------
 SPREADSHEET_ID = st.secrets["app"]["spreadsheet_id"]
 WORKSHEET_NAME = st.secrets["app"].get("worksheet_name", "Sheet1")
 
@@ -20,6 +23,8 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
         cand_l = cand.lower()
         if cand_l in lowered:
             return lowered[cand_l]
+
+    # partial match fallback
     for c in cols:
         c_l = c.lower()
         for cand in candidates:
@@ -36,6 +41,11 @@ def _status_badge(value: str) -> str:
     if v in {"REJECTED", "REJECT", "DECLINED"}:
         return "⛔ **REJECTED**"
     return f"**{value}**" if value else "—"
+
+def _clean_cell(x: object) -> str:
+    s = "" if x is None else str(x)
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_from_google_sheet(spreadsheet_id: str, worksheet_name: str) -> pd.DataFrame:
@@ -58,10 +68,8 @@ def load_from_google_sheet(spreadsheet_id: str, worksheet_name: str) -> pd.DataF
 
     # Clean up strings
     for c in df.columns:
-        df[c] = (
-            df[c].astype("string").fillna("")
-            .map(lambda x: re.sub(r"[ \t]+", " ", str(x)).strip())
-        )
+        df[c] = df[c].map(_clean_cell).astype("string")
+
     return df
 
 # -----------------------------
@@ -72,28 +80,49 @@ if df.empty:
     st.error("Google Sheet is empty or could not be read.")
     st.stop()
 
-# Identify columns
-col_status = _find_col(df, ["Status"])  # Column L in your file
+# -----------------------------
+# Column mapping (robust)
+# -----------------------------
+col_status    = _find_col(df, ["Status"])  # Column L in your file
 col_charterer = _find_col(df, ["Charterer"])
-col_company = _find_col(df, ["Company"])
-col_owner = _find_col(df, ["Parent Company/Ownership", "Ownership", "Parent Company"])
-col_address = _find_col(df, ["Address"])
+col_company   = _find_col(df, ["Company"])
+col_owner     = _find_col(df, ["Parent Company/Ownership", "Ownership", "Parent Company"])
+col_address   = _find_col(df, ["Address"])
 
-# Pool Agreement (Column D) is explanatory detail
-col_pool = _find_col(df, ["Pool Agreement"])
+# Detail-only fields (shown only when a counterparty is selected)
+col_pool      = _find_col(df, ["Pool Agreement"])
+col_sp        = _find_col(df, ["S&P", "S&P Rating", "S&P rating"])
+col_moodys    = _find_col(df, ["Moody", "Moody's", "Moody's Rating"])
+col_infospec  = _find_col(df, ["InfoSpectrum", "Info Spectrum", "Infospectrum Rating"])
+col_dynamar   = _find_col(df, ["Dynamar", "Dynamar Rating"])
+col_sanctions = _find_col(df, ["Sanctions Check", "Sanction Check", "Sanctions"])
+col_comments  = _find_col(df, ["Comment", "Comments"])
 
-if not col_charterer:
-    st.error("Couldn't find a 'Charterer' column in the Google Sheet.")
-    st.stop()
-if not col_status:
-    st.error("Couldn't find a 'Status' column in the Google Sheet (expected Column L).")
+# Validate must-have columns
+missing = []
+for name, c in [
+    ("Charterer", col_charterer),
+    ("Status", col_status),
+    ("Company", col_company),
+    ("Parent company/ownership", col_owner),
+    ("Address", col_address),
+]:
+    if not c:
+        missing.append(name)
+
+if missing:
+    st.error(
+        "Missing required columns in the Google Sheet: "
+        + ", ".join(missing)
+        + ". Please verify the header names."
+    )
     st.stop()
 
 # -----------------------------
 # UI
 # -----------------------------
 st.title("Counterparty (Charterer) Search")
-st.caption("Source: Counterparty List")
+st.caption("Source: Counterparty List (Google Sheet)")
 
 c1, c2 = st.columns([2, 1])
 with c1:
@@ -106,7 +135,7 @@ with c2:
 
 df_work = df.copy()
 
-# Search logic (charterer first, else full-row search)
+# Search logic: prefer charterer matches; otherwise search entire row text
 if search_text.strip():
     s = search_text.strip().lower()
     charterer_series = df_work[col_charterer].astype("string").fillna("")
@@ -123,52 +152,75 @@ else:
 if not show_only and search_text.strip():
     df_filtered = df_work.copy()
 
-# Selector
+# Selection list
 options = df_filtered[col_charterer].dropna().astype("string")
 options = options[options.str.len() > 0]
 options_unique = sorted(options.unique().tolist(), key=lambda x: x.lower())
 
-selected = st.selectbox("Select charterer", ["(select)"] + options_unique)
+selected = st.selectbox("Select charterer / counterparty", ["(select)"] + options_unique)
 
-# Detail panel
+# -----------------------------
+# Selected counterparty details
+# -----------------------------
 if selected != "(select)":
+    # If duplicates exist, pick the first exact match (you can change to show all matches if needed)
     row = df_work[df_work[col_charterer].astype("string") == selected].head(1)
-    if not row.empty:
+
+    if row.empty:
+        st.warning("No exact match found (possible whitespace/duplicate formatting). Try searching again.")
+    else:
         r = row.iloc[0]
 
-        top1, top2 = st.columns([1.2, 2.8])
+        t1, t2, t3 = st.columns([1.1, 1.4, 1.5])
 
-        with top1:
+        with t1:
             st.subheader("Status")
-            st.markdown(_status_badge(str(r.get(col_status, ""))))
+            st.markdown(_status_badge(r.get(col_status, "")))
 
-        with top2:
-            st.subheader("Counterparty details")
+            if col_sanctions:
+                st.subheader("Sanctions check")
+                sanc = r.get(col_sanctions, "")
+                st.write(sanc if str(sanc).strip() else "—")
+
+        with t2:
+            st.subheader("Counterparty")
             st.write(f"**Charterer:** {r.get(col_charterer, '—')}")
-            if col_company:
-                st.write(f"**Company:** {r.get(col_company, '—')}")
-            if col_owner:
-                st.write(f"**Parent company / ownership:** {r.get(col_owner, '—')}")
-            if col_address:
-                st.write("**Address:**")
-                st.code(r.get(col_address, "—") or "—", language="text")
+            st.write(f"**Company:** {r.get(col_company, '—')}")
+            st.write(f"**Parent company / ownership:** {r.get(col_owner, '—')}")
 
-            # Optional: show pool agreement clause as explanation
+            st.subheader("Address")
+            st.code(r.get(col_address, "—") or "—", language="text")
+
+        with t3:
+            st.subheader("Ratings")
+            st.write(f"**S&P:** {r.get(col_sp, '—') if col_sp else '—'}")
+            st.write(f"**Moody's:** {r.get(col_moodys, '—') if col_moodys else '—'}")
+            st.write(f"**InfoSpectrum:** {r.get(col_infospec, '—') if col_infospec else '—'}")
+            st.write(f"**Dynamar:** {r.get(col_dynamar, '—') if col_dynamar else '—'}")
+
             if col_pool:
                 pool_val = r.get(col_pool, "")
                 if str(pool_val).strip():
-                    st.write("**Pool Agreement (Clause):**")
+                    st.subheader("Pool agreement clause")
                     st.code(pool_val, language="text")
 
+        st.divider()
+
+        st.subheader("Comments")
+        if col_comments:
+            comm = r.get(col_comments, "")
+            st.write(comm if str(comm).strip() else "—")
+        else:
+            st.write("—")
+
+# -----------------------------
+# Table view (ONLY requested columns)
+# -----------------------------
 st.subheader("All / Filtered counterparties")
 
-# TABLE: Only show requested columns
-table_cols = []
-for c in [col_status, col_charterer, col_company, col_owner, col_address]:
-    if c and c in df_filtered.columns:
-        table_cols.append(c)
+table_cols = [col_status, col_charterer, col_company, col_owner, col_address]
+table_cols = [c for c in table_cols if c and c in df_filtered.columns]
 
-# If any are missing, still show what we have (but ideally these exist)
 st.dataframe(df_filtered[table_cols], use_container_width=True, hide_index=True)
 
 
